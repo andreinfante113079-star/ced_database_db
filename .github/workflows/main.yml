@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""
+Build script for Primary Structures dashboard.
+
+Downloads the latest Excel file from Google Drive, cleans the data,
+and emits projects.json next to the dashboard HTML.
+
+Environment variables required:
+  GDRIVE_FILE_ID         - the file ID from the Google Drive share link
+  GOOGLE_CREDENTIALS_JSON - service account credentials (JSON string)
+"""
+import os
+import io
+import json
+import re
+import sys
+import numpy as np
+import pandas as pd
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+
+
+FILE_ID = os.environ.get('GDRIVE_FILE_ID', '').strip()
+CREDS_JSON = os.environ.get('GOOGLE_CREDENTIALS_JSON', '').strip()
+OUTPUT_DIR = os.environ.get('OUTPUT_DIR', 'public')
+
+if not FILE_ID:
+    sys.exit("ERROR: GDRIVE_FILE_ID env var not set")
+if not CREDS_JSON:
+    sys.exit("ERROR: GOOGLE_CREDENTIALS_JSON env var not set")
+
+
+def download_excel():
+    """Download the .xlsx file from Google Drive using a service account."""
+    creds = service_account.Credentials.from_service_account_info(
+        json.loads(CREDS_JSON),
+        scopes=['https://www.googleapis.com/auth/drive.readonly']
+    )
+    service = build('drive', 'v3', credentials=creds)
+
+    request = service.files().get_media(fileId=FILE_ID)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    buf.seek(0)
+    print(f"  Downloaded {buf.getbuffer().nbytes} bytes from Google Drive")
+    return buf
+
+
+def parse_year(v):
+    if pd.isna(v):
+        return None
+    m = re.search(r'(\d{4})', str(v))
+    return int(m.group(1)) if m else None
+
+
+def num(v):
+    if pd.isna(v):
+        return None
+    try:
+        f = float(v)
+        if np.isnan(f):
+            return None
+        return int(f) if f.is_integer() else round(f, 4)
+    except (ValueError, TypeError):
+        return None
+
+
+def text(v):
+    if pd.isna(v):
+        return None
+    s = str(v).strip()
+    return s if s else None
+
+
+def clean_dataframe(df):
+    """Normalize categorical duplicates and trim whitespace."""
+    df = df.drop(
+        columns=[c for c in ['Unnamed: 0', 'Unnamed: 3', 'Unnamed: 26'] if c in df.columns],
+        errors='ignore'
+    )
+    df = df.dropna(subset=['PROJECT']).reset_index(drop=True)
+
+    for c in df.select_dtypes(include='object').columns:
+        df[c] = df[c].astype(str).str.strip()
+        df[c] = df[c].replace({'nan': np.nan, 'NaN': np.nan, '': np.nan})
+
+    df['BUILDING CATEGORY'] = df['BUILDING CATEGORY'].replace({
+        'MIXED USE BLDGS': 'MIXED USE',
+        'STANDARD FACTORY': 'PRODUCTION PLANT',
+    })
+    df['DESIGNER'] = df['DESIGNER'].replace({
+        'JOSE ROE T. BAEL - STED': 'JOSE ROE T. BAEL',
+        'WALLACE': 'ENGR. WALLACE D. LESTANO, F. ASEP',
+    })
+    df['TYPE OF OCCUPANCY'] = df['TYPE OF OCCUPANCY'].replace({
+        'RESIDENTIAL & HOTEL': 'RESIDENTIAL',
+    })
+    df['TYPE OF FOUNDATION'] = df['TYPE OF FOUNDATION'].replace({
+        'MAT FOOTING + ISOLATED FTG': 'ISOLATED FTG + MAT FOOTING',
+        'ISOLATED FTG AND MAT FOOTING': 'ISOLATED FTG + MAT FOOTING',
+    })
+
+    df['YEAR_START'] = df['YEAR'].apply(parse_year)
+    return df
+
+
+def row_to_dict(r):
+    return {
+        'name': text(r.get('PROJECT')),
+        'owner': text(r.get('OWNER')),
+        'location': text(r.get('LOCATION')),
+        'year': text(r.get('YEAR')),
+        'yearStart': num(r.get('YEAR_START')),
+        'occupancy': text(r.get('TYPE OF OCCUPANCY')),
+        'category': text(r.get('BUILDING CATEGORY')),
+        'designer': text(r.get('DESIGNER')),
+        'tfa': num(r.get('TFA (sqm)')),
+        'footprint': num(r.get('BUILDING FOOTPRINT')),
+        'units': num(r.get('NO. OF UNITS')),
+        'height': num(r.get('BUILDING HEIGHT')),
+        'levels': num(r.get('NO. OF LEVELS')),
+        'foundation': text(r.get('TYPE OF FOUNDATION')),
+        'approach': text(r.get('CONSTRUCTION APPROACH')),
+        'concrete': num(r.get('CONCRETE, cu.m')),
+        'rebar': num(r.get('REBAR, kgs.')),
+        'forms': num(r.get('FORMS, sq.m')),
+        'cumTfa': num(r.get('CUM/TFA')),
+        'kgTfa': num(r.get('KG/TFA')),
+        'sqmTfa': num(r.get('SQM/TFA')),
+    }
+
+
+def main():
+    print("→ Downloading Excel from Google Drive...")
+    excel_buf = download_excel()
+
+    print("→ Reading 'Database Library' sheet...")
+    df = pd.read_excel(excel_buf, sheet_name='Database Library', header=4)
+
+    print(f"→ Cleaning data (raw: {len(df)} rows)...")
+    df = clean_dataframe(df)
+    print(f"  After cleanup: {len(df)} projects")
+
+    projects = [row_to_dict(row) for _, row in df.iterrows()]
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    out_path = os.path.join(OUTPUT_DIR, 'projects.json')
+
+    from datetime import datetime, timezone
+    payload = {
+        'updatedAt': datetime.now(timezone.utc).isoformat(),
+        'count': len(projects),
+        'projects': projects,
+    }
+
+    with open(out_path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    print(f"✓ Wrote {out_path} ({len(projects)} projects)")
+
+
+if __name__ == '__main__':
+    main()
+
+pandas>=2.0
+openpyxl>=3.1
+numpy>=1.24
+google-api-python-client>=2.100
+google-auth>=2.20
+
+# Primary Structures Dashboard — Setup Guide
+
+This package deploys your dashboard to a private team site. The workflow:
+
+1. You edit the Excel file in Google Drive like normal
+2. When ready to refresh, click a "Rebuild" button (on the site or in GitHub)
+3. The dashboard rebuilds from the latest Excel and auto-deploys
+4. Only approved teammates can see the URL
+
+## What you'll need
+
+- A free GitHub account
+- A free Cloudflare account (for hosting + access control)
+- Your Google account (where the Excel lives)
+
+Total setup time: about 30 minutes the first time.
+
+---
+
+## Part 1 — Google Drive setup (5 min)
+
+### 1a. Upload the Excel file to a folder
+
+Put your `PEG-Ratio-Database_...xlsx` in a Google Drive folder. Keep the filename stable — don't add timestamps to the name. Use the same file every time and just save over it.
+
+### 1b. Create a service account (gives the rebuild script permission to read the file)
+
+1. Go to https://console.cloud.google.com
+2. Create a new project (call it anything, e.g. "primary-structures-dashboard")
+3. Enable the Google Drive API: https://console.cloud.google.com/apis/library/drive.googleapis.com → click **Enable**
+4. Create a service account: **IAM & Admin → Service Accounts → Create Service Account**
+   - Name it `dashboard-reader`
+   - Skip the optional permissions steps
+5. After creation, click the service account → **Keys** tab → **Add Key → Create new key → JSON**
+   - A `.json` file downloads. **Keep this safe** — you'll paste its contents into GitHub in a moment.
+6. Open the JSON file in a text editor and copy the `client_email` value (looks like `dashboard-reader@your-project.iam.gserviceaccount.com`)
+
+### 1c. Share the Excel with the service account
+
+1. Right-click your Excel file in Drive → **Share**
+2. Paste the service account email
+3. Give it **Viewer** access → **Send**
+
+### 1d. Get the file ID
+
+Open the file in Drive. The URL looks like:
+`https://docs.google.com/spreadsheets/d/THIS_LONG_STRING_IS_THE_FILE_ID/edit...`
+
+Copy that long string between `/d/` and `/edit`. Save it for later.
+
+---
+
+## Part 2 — GitHub setup (10 min)
+
+### 2a. Create a repository
+
+1. Go to https://github.com/new
+2. Name it `primary-structures-dashboard` (or whatever you like)
+3. **Keep it Private**
+4. Don't initialize with anything — leave it empty
+
+### 2b. Upload these files
+
+Easiest method via web:
+1. On your new empty repo page, click **uploading an existing file**
+2. Drag the entire contents of this `deployment` folder in (including the `.github` folder and its subfolders)
+3. Commit at the bottom of the page
+
+If you have `git` installed, you can instead run from the deployment folder:
+```bash
+git init
+git add .
+git commit -m "Initial dashboard setup"
+git branch -M main
+git remote add origin https://github.com/YOUR_USERNAME/primary-structures-dashboard.git
+git push -u origin main
+```
+
+### 2c. Add your secrets
+
+1. In the repo, go to **Settings → Secrets and variables → Actions**
+2. Click **New repository secret** twice to add:
+
+   **Name:** `GDRIVE_FILE_ID`
+   **Value:** (the file ID you copied in step 1d)
+
+   **Name:** `GOOGLE_CREDENTIALS_JSON`
+   **Value:** (paste the **entire contents** of the JSON file you downloaded in step 1b, including the `{` and `}`)
+
+### 2d. Test the rebuild button
+
+1. Go to the **Actions** tab in your repo
+2. Click **Rebuild Dashboard** on the left
+3. Click the **Run workflow** dropdown → **Run workflow**
+4. Wait about 30 seconds — green checkmark means it worked
+5. Check the `public/projects.json` file in your repo — it should now contain your data
+
+If you get an error, click into the run to see the log. Most common issue: the service account email wasn't shared on the Excel file.
+
+---
+
+## Part 3 — Cloudflare Pages deployment (10 min)
+
+### 3a. Connect Cloudflare to your repo
+
+1. Sign up / log in at https://dash.cloudflare.com
+2. **Workers & Pages → Create → Pages → Connect to Git**
+3. Authorize Cloudflare to read your GitHub repos, then pick `primary-structures-dashboard`
+4. In the build settings:
+   - **Framework preset:** None
+   - **Build command:** (leave blank)
+   - **Build output directory:** `public`
+5. **Save and Deploy**
+
+About a minute later you'll get a URL like `https://primary-structures-dashboard.pages.dev`. Open it — the dashboard should load with your data.
+
+### 3b. Lock it down to specific emails (Cloudflare Access)
+
+1. In Cloudflare dashboard: **Zero Trust → Access → Applications → Add an application → Self-hosted**
+2. **Application name:** Primary Structures Dashboard
+3. **Application domain:** your `pages.dev` URL
+4. Continue → **Add a policy**
+   - **Policy name:** Approved teammates
+   - **Action:** Allow
+   - **Include rule:** **Emails** → list each teammate's email, one per line
+5. Save the policy and the application
+
+Now anyone visiting the URL must sign in with one of the allowed emails (they'll get a one-time login code).
+
+### 3c. Point the in-site Rebuild button at your GitHub Actions
+
+1. Open `public/index.html` in your GitHub repo, click the pencil icon to edit
+2. Find this line near the bottom (inside the `<script>` tag):
+   ```js
+   const REBUILD_URL = 'REPLACE_WITH_YOUR_GITHUB_ACTIONS_URL';
+   ```
+3. Replace it with:
+   ```
+   https://github.com/YOUR_USERNAME/primary-structures-dashboard/actions/workflows/rebuild.yml
+   ```
+4. Commit. Cloudflare auto-redeploys within ~30 seconds.
+
+---
+
+## Daily usage
+
+When you update the Excel:
+
+1. Edit your Excel file in Google Drive (it stays at the same URL/file ID)
+2. Save it (Drive does this automatically)
+3. On the dashboard, click **Rebuild** in the top right
+4. You land on the GitHub Actions page → click **Run workflow → Run workflow**
+5. Wait ~30 seconds → refresh the dashboard → updated data shows up
+
+The "Last updated" timestamp on the dashboard tells you when the data was last pulled.
+
+---
+
+## Sharing with teammates
+
+Just send them the `https://primary-structures-dashboard.pages.dev` URL. Cloudflare prompts them to sign in with their email; if it's on your allowlist, they're in.
+
+To add or remove people: **Cloudflare Zero Trust → Access → Applications → edit your policy** → update the email list.
+
+---
+
+## Files in this package
+
+| File | Purpose |
+|---|---|
+| `public/index.html` | The dashboard itself (gets deployed) |
+| `public/projects.json` | Project data (regenerated by the rebuild script) |
+| `scripts/build.py` | Downloads Excel from Drive, converts to JSON |
+| `.github/workflows/rebuild.yml` | The "Rebuild" button workflow |
+| `requirements.txt` | Python dependencies |
+
+---
+
+## Troubleshooting
+
+**Rebuild fails with "File not found"**
+→ The service account email isn't shared on the Excel file. Re-share it (step 1c).
+
+**Rebuild fails with "ERROR: GDRIVE_FILE_ID env var not set"**
+→ Secrets weren't added to GitHub. Re-check step 2c — the names must match exactly.
+
+**Dashboard says "Could not load project data"**
+→ Run the rebuild workflow at least once. The first deploy ships with an empty `projects.json`.
+
+**Excel column names changed**
+→ Edit `scripts/build.py` and update the column names in `row_to_dict()`.
+
+**Want to add another teammate**
+→ Cloudflare Zero Trust → Access → Applications → edit the policy → add their email.
